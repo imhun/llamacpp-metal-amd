@@ -46,25 +46,77 @@ Vulkan0: AMD Radeon Pro 5500M (8176 MiB)
 Vulkan1: Intel(R) UHD Graphics 630 (65536 MiB)
 ```
 
-但输出全是 `1`，根因还没定位。日志里有算子回退告警：
+输出乱码其实是**两个独立的问题**叠在一起。
+
+#### 一、不指定设备时，这个构建会同时用 Metal 和 Vulkan
+
+二进制里 Metal 和 Vulkan 两个后端都在，`-ngl 99` 不带 `-dev` 时调度器会把 25 层拆开：
 
 ```
-W warmup: WARNING: the CLIP graph uses unsupported operators by the backend
-W warmup:          the performance will be suboptimal
-W warmup: list of unsupported ops (backend=Vulkan0):
-W warmup:   SOFT_MAX: type = f32, ne = [8580 8580 12 1]
+I load_tensors:  MTL0_Mapped model buffer size =   159.35 MiB
+I load_tensors:      Vulkan0 model buffer size =   334.98 MiB
 ```
 
-**这条告警不能当成失败原因**——打上补丁的 Metal 后端跑同样的模型时，告警列表一模一样
-（同样的 `SOFT_MAX` / `CONT` / `PERMUTE` / `ROPE`，只有尺寸随分辨率变化），结果却是
-正确的。它只说明这些算子回退到 CPU、性能打折。症状对应
-[issue #20104](https://github.com/ggml-org/llama.cpp/issues/20104)
-（Vulkan on Intel Macs produce gibberish），该 issue 被标记为 #20029 的重复项。
-运行前需要指定 ICD：
+跨后端跑文本推理就是整屏 `@@@@`。**只要显式锁一个设备，文本部分完全正确**：
+
+```bash
+llama-cli -m models/OvisOCR2-Q4_K_M.gguf -ngl 99 -dev Vulkan0 -p "The capital of France is"
+# → The capital of France is / Paris   （正确）
+```
+
+`-dev Vulkan1`（Intel 核显）更糟，连 compute pipeline 都建不起来
+（`ErrorInitializationFailed`），视觉编码放上去直接 `device lost` 崩溃。
+
+#### 二、视觉编码器在 Vulkan 上确实算错，和文本路径无关
+
+锁定 `-dev Vulkan0 -mmdev Vulkan0` 之后语言模型正常，但把 mmproj 交给 GPU 就退化：
+
+| 视觉编码执行位置 | 整页输出 |
+| --- | --- |
+| Vulkan0（默认） | `1 1 1 1…` / `## 1` / `The quick brown fox…` 死循环 |
+| 补丁版 Metal | 正确 |
+| CPU（`--no-mmproj-offload`） | 正确，且与 Metal 参考**逐字节一致** |
+
+用 `llama-mtmd-debug -p encode` 把两侧每个视觉张量 dump 出来比对（每个张量块末尾带
+`sum =` 校验值，可以全量对齐，不受 `...` 省略影响），误差随图像边长单调放大：
+
+| 图像边长 n | `Vcur-1`（第 1 个注意力块的 V 投影）相对差 | 投影器输出相对差 |
+| --- | --- | --- |
+| 256 | 0.76% | 1.74% |
+| 512 | 1.19% | 0.87% |
+| 1024 | 4.60% | 0.23% |
+| 1600 | **544%** | **75%** |
+
+小图那点误差还是 f16 累加的正常抖动，1024 起就超出正常范围，1600 则整段编码器从第一个
+注意力块开始就废了。真实页面是 9440 个图像 token（约合 n≈1552），必然命中。
+
+已经排除的：
+
+- **不是单个算子的数值错**：`test-backend-ops -b Vulkan0` 全部 13688 项通过。
+- **不是 CLIP 算子回退告警**：打补丁的 Metal 后端有完全相同的列表（`SOFT_MAX` / `CONT` /
+  `PERMUTE` / `ROPE` / `VIEW` / `MUL_MAT` / `MUL` / `ADD`，只有尺寸随分辨率变化），输出却是
+  正确的。它只说明这些算子回退到 CPU、性能打折。
+- **不是 pinned memory 告警**：`Failed to allocate pinned memory` 之后
+  `ggml-vulkan.cpp` 会回退到 CPU buffer，纯文本推理也报这条，结果照样正确。
+- **不是竞态**：贪心解码（`--temp 0 --seed 42`）下坏输出稳定复现，两次逐字节相同。
+- **开关都无效**：`GGML_VK_DISABLE_F16` / `DISABLE_GRAPH_OPTIMIZE` / `DISABLE_FUSION` /
+  `PREFER_HOST_MEMORY` / `DISABLE_ASYNC` / `SERIALIZE_SUBMISSIONS` / `DISABLE_MMVQ` /
+  `FORCE_MMVQ` / `DISABLE_INTEGER_DOT_PRODUCT` / `MAX_NODES_PER_SUBMIT=1` 逐个试过，全是乱码。
+
+所以根因（MoltenVK/AMD 驱动侧，还是 ggml-vulkan 大尺寸 kernel 的数值问题）仍未定位，
+只能确认症状与 [issue #20104](https://github.com/ggml-org/llama.cpp/issues/20104)
+（Vulkan on Intel Macs produce gibberish）一致，该 issue 被标记为 #20029 的重复项。
+
+#### 能用的 Vulkan 配置：文本上 GPU，视觉编码回退 CPU
 
 ```bash
 export VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json
+llama-mtmd-cli -m models/OvisOCR2-Q4_K_M.gguf --mmproj models/mmproj-F16.gguf \
+  --image page.png -p "…" -ngl 99 -dev Vulkan0 --no-mmproj-offload
 ```
+
+1240×1754 的整页实测 45 s（同页补丁 Metal 15 s）。比全 CPU 快，可以当作独立于
+Metal 补丁的第二条路。
 
 ### 打上 ToshLLM 补丁之后
 
@@ -75,7 +127,8 @@ export VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json
 | --- | --- | --- | --- |
 | CPU（Accelerate） | 159 s | — | 正确但慢 |
 | Metal（官方构建） | 39.4 s | 崩溃 | `@@@@@@` + GPU Timeout |
-| Vulkan（MoltenVK） | ~27 s | 41 s | 全为 `1` |
+| Vulkan（MoltenVK，视觉也上 GPU） | ~27 s | 41 s | 视觉编码算错，输出全为 `1` |
+| **Vulkan（MoltenVK，视觉回退 CPU）** | — | **45 s** | **正确，与 Metal 参考逐字节一致** |
 | **Metal（打上补丁）** | **6.2 s** | **15 s** | **完全正确** |
 
 稳定性：连续 3 次均为 12 s、0 乱码、视觉编码 5.63 s。
