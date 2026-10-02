@@ -196,9 +196,17 @@ if [ "$FORCE" -eq 1 ] && [ -d "$BUILD_PATH" ]; then
     ok "已移走旧构建目录"
 fi
 
-if [ -x "$LLAMA_BIN" ]; then
+# 只看二进制存在与否是不够的：目录里可能躺着别人（或更早的官方构建）编出来的
+# 同名文件。用补丁标记做凭据，对不上就当它不存在。
+BUILD_STAMP="$BUILD_PATH/.patch-series"
+if [ -x "$LLAMA_BIN" ] && [ -f "$BUILD_STAMP" ] && [ "$(cat "$BUILD_STAMP")" = "$MARKER_VALUE" ]; then
     ok "已有构建产物，跳过（重编加 --rebuild）"
 else
+    if [ -e "$BUILD_PATH" ]; then
+        mv "$BUILD_PATH" "$BUILD_PATH.stale-$(date +%s)"
+        warn "旧构建目录没有对应的补丁标记，已移开（$BUILD_PATH.stale-*），重新编译"
+    fi
+
     if [ "$ARCH" = "x86_64" ]; then
         SIMD_FLAGS=(
             -DGGML_NATIVE=OFF -DCMAKE_OSX_ARCHITECTURES=x86_64
@@ -225,6 +233,7 @@ else
     cmake --build "$BUILD_PATH" -j "$JOBS" -t llama-mtmd-cli > tmp/cmake-build.log 2>&1 \
         || die "编译失败，日志尾部：
 $(tail -20 tmp/cmake-build.log)"
+    printf '%s' "$MARKER_VALUE" > "$BUILD_STAMP"
     ok "编译完成"
 fi
 
