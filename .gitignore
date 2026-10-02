@@ -1,0 +1,5 @@
+# llama.cpp 源码与构建产物（脚本生成，不入库）
+tmp/
+
+# macOS
+.DS_Store

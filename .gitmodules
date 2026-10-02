@@ -1,0 +1,4 @@
+[submodule "third_party/toshllm"]
+	path = third_party/toshllm
+	url = https://github.com/engeldlgado/toshllm.git
+	shallow = true
