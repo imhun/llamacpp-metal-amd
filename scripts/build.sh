@@ -250,11 +250,16 @@ else
 fi
 
 step "完成"
+# --work-dir 可能是绝对路径（被别的仓库调用时就是这样），别再拼一次 ROOT
+case "$LLAMA_BIN" in
+    /*) BIN_DISPLAY="$LLAMA_BIN" ;;
+    *)  BIN_DISPLAY="$ROOT/$LLAMA_BIN" ;;
+esac
 cat <<EOF
-  产物:  $ROOT/$LLAMA_BIN
+  产物:  $BIN_DISPLAY
 
   用法（llama.cpp 自带的多模态 CLI）:
-    $LLAMA_BIN -m 模型.gguf --mmproj mmproj.gguf --image 页面.png -p "提示词"
+    $BIN_DISPLAY -m 模型.gguf --mmproj mmproj.gguf --image 页面.png -p "提示词"
 
   改 pin 的版本: 编辑 versions.env，然后 ./scripts/build.sh --clean
 EOF
